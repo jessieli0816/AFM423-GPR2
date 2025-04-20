@@ -1,0 +1,288 @@
+---
+title: "AFM423 Group Project - Unsupervised Learning Methods in Factor Investing"
+author: "Raynor Sun, Jessie Li, Rachel Wu"
+date: "Due: 2025-04-20"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load libraries and data
+```{r, message = FALSE, warning = FALSE}
+library(tidyverse)                      # Activate the data science package
+library(lubridate)                      # Activate the date management package
+library(dplyr)
+library(tidyr)
+library(purrr)
+library(dplyr)
+library(ggplot2)
+library(lubridate)
+library(readr)
+library(lubridate)
+
+
+load("data_ml.RData")                   # Load the data
+data_ml <- data_ml %>% 
+    filter(date > "1999-12-31",         # Keep the date with sufficient data points
+           date < "2019-01-01") %>%
+    arrange(stock_id, date)             # Order the data
+```
+
+## Data arrangement
+```{r data arrangement}
+sep_oos <- as.Date("2007-01-01") # Starting point for backtest
+
+m_offset <- 12
+
+train_data <- data_ml %>% filter(date < sep_oos - m_offset * 30)
+
+test_data <- data_ml %>% filter(date > sep_oos)
+```
+
+# Part 1: PCA Analysis
+## Function to perform PCA on the given dataset
+```{r pc_generate}
+pc_generate <- function(dataset) {
+  #store original dataset
+  origin_dataset <- dataset
+  
+  # Step 1: Prepare the data
+  # Identify non-feature columns
+  non_features <- c("stock_id", "date", "R1M_Usd", "R3M_Usd", "R6M_Usd", "R12M_Usd")
+  
+  # Convert date
+  dataset$date <- as.Date(dataset$date)
+  
+  # Remove non-feature columns for PCA
+  feature_data <- dataset %>%
+    select(-all_of(non_features)) %>%
+    na.omit()  # Remove NA rows
+  
+  # Step 2: Apply PCA
+  
+  # Perform PCA
+  pca_result <- prcomp(feature_data, center = TRUE, scale. = TRUE)
+  
+  # Examine explained variance
+  var_explained <- summary(pca_result)$importance[2, ]
+  cum_var <- cumsum(var_explained)
+  
+  # Choose number of components to retain 90% variance
+  num_pc <- which(cum_var >= 0.9)[1]
+  cat("Number of components to retain 90% variance:", num_pc, "\n")
+  
+  # Store the data
+  df_pca <- as.data.frame(pca_result$x[, 1:num_pc])
+  
+  # Step 3: Recreate a complete dataset for clustering
+  df_final <- bind_cols(origin_dataset %>% select(stock_id, date),
+                        df_pca,
+                        origin_dataset %>% select(non_features[-c(1, 2)]))
+  
+  # Return dataframes as a list
+  return(list(df_pca = df_pca, df_final = df_final))
+}
+```
+
+# Part 2: K-means Clustering
+## Function to perform clustering on the given dataset
+```{r clustering, warning=FALSE}
+clustering <- function(df_pca){
+  # Try clustering with k from 1 to 10
+  sse <- numeric()
+  for (k in 1:10) {
+    kmeans_model <- kmeans(df_pca, centers = k, nstart = 25)
+    sse[k] <- kmeans_model$tot.withinss
+  }
+  
+  plot(
+    1:10,
+    sse,
+    type = "b",
+    xlab = "Number of Clusters (k)",
+    ylab = "SSE",
+    main = "Elbow Method for Optimal k"
+  )
+}
+```
+
+```{r training, warning=FALSE}
+pca_results <- pc_generate(train_data)
+clustering(pca_results$df_pca)
+```
+## After training on the data before 2017-01-01, we see that cluster of 4 is optimal.
+
+```{r refit test data, warning = FALSE} 
+pca_results <- pc_generate(test_data)
+clustering(pca_results$df_pca)
+```
+
+```{r k-means, warning=FALSE}
+# Run K-means with 4 clusters
+set.seed(423)
+df_final <- pca_results$df_final
+df_pca <- pca_results$df_pca
+final_kmeans <- kmeans(pca_results$df_pca, centers = 4, nstart = 25)
+
+df_final$cluster <- as.factor(final_kmeans$cluster)
+```
+
+# Part 3: Backtest
+```{r backtest}
+# Add cluster and future return info
+backtest_data <- df_final %>%
+  select(stock_id, date, cluster, R1M_Usd) %>%
+  filter(!is.na(R1M_Usd))
+```
+
+## Monthly portfolio returns and Cumulative Return
+```{r backtest_metrics}
+# Monthly portfolio returns for each cluster
+monthly_returns <- backtest_data %>%
+  group_by(date, cluster) %>%
+  summarise(
+    cluster_ret = mean(R1M_Usd),
+    .groups = "drop"
+  )
+
+# Visualize performance of each cluster
+ggplot(monthly_returns, aes(x = date, y = cluster_ret, color = cluster)) +
+  geom_line() +
+  labs(title = "Monthly Returns by Cluster",
+       y = "Return",
+       x = "Date") +
+  theme_minimal()
+
+# Cumulative return for each cluster
+cumulative_returns <- monthly_returns %>%
+  group_by(cluster) %>%
+  arrange(date) %>%
+  mutate(cum_ret = cumprod(1 + cluster_ret)) %>%
+  ungroup()
+
+# Visualize cumulative return
+ggplot(cumulative_returns, aes(x = date, y = cum_ret, color = cluster)) +
+  geom_line() +
+  labs(title = "Cumulative Return by Cluster",
+       y = "Cumulative Return",
+       x = "Date") +
+  theme_minimal()
+
+# Summary stats
+summary_stats <- monthly_returns %>%
+  group_by(cluster) %>%
+  summarise(
+    mean_return = mean(cluster_ret),
+    sd_return = sd(cluster_ret),
+    sharpe_ratio = mean(cluster_ret) / sd(cluster_ret)
+  )
+
+summary_stats
+```
+
+#Compare with FF 5-factor regression model
+
+##Read in FF factors
+```{r, message = FALSE, warning = FALSE}
+
+# Download FF 5-factor data
+temp <- tempfile()
+url <- "http://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_CSV.zip"
+download.file(url, temp, mode = "wb")
+
+# Read data and clean it
+FF_factors_raw <- read_csv(unz(temp, "F-F_Research_Data_5_Factors_2x3.csv"), skip = 3)
+
+# Find where the real data ends
+end_row <- which(is.na(FF_factors_raw[[1]]))[1] - 1
+
+# Trim off footer rows
+FF_factors <- FF_factors_raw[1:end_row, ]
+
+# Clean column names
+colnames(FF_factors)[1] <- "date"
+colnames(FF_factors) <- gsub(" ", "", colnames(FF_factors))
+
+# Convert to proper format
+FF_factors <- FF_factors %>%
+  mutate(
+    date = ymd(parse_date_time(date, "Y%m")),
+    date = rollback(date + months(1)),  # Set to end of month
+    across(!date, as.numeric),
+    across(!date, ~ .x / 100)           # Convert % to decimal
+  )
+
+colnames(FF_factors)[1] <- "date"
+colnames(FF_factors) <- gsub("-", "_", colnames(FF_factors))  # "Mkt-RF" → "MKT_RF"
+
+head(FF_factors)
+
+# Merge FF factors with test_data
+ff_test_data <- test_data %>%
+  select(stock_id, date, R1M_Usd) %>%
+  inner_join(FF_factors, by = "date") %>%
+  mutate(Excess_Return = R1M_Usd - RF) %>%
+  na.omit()
+```
+
+##FF 5-factor Model fit and predictopm
+```{r prediction}
+
+# Already done in earlier step — reminder here:
+ff_model <- lm(R1M_Usd ~ Mkt_RF + SMB + HML + RMW + CMA, data = ff_test_data)
+
+# Add predicted values
+ff_test_data$R1M_Usd_pred <- predict(ff_model, newdata = ff_test_data)
+
+ff_returns <- ff_test_data %>%
+  group_by(date) %>%
+  summarise(
+    actual = mean(R1M_Usd, na.rm = TRUE),
+    predicted = mean(R1M_Usd_pred, na.rm = TRUE),
+    .groups = "drop"
+  )
+
+# Plot: Actual vs Predicted
+ff_returns_long <- ff_returns %>%
+  pivot_longer(cols = c(actual, predicted), names_to = "type", values_to = "return")
+
+ggplot(ff_returns_long, aes(x = date, y = return, color = type)) +
+  geom_line() +
+  labs(title = "Monthly Returns: FF Regression vs Actual",
+       y = "Monthly Return", x = "Date") +
+  theme_minimal()
+
+#Plot: Actual Vs. Cumulative return
+
+ff_returns_cum <- ff_returns_long %>%
+  group_by(type) %>%
+  arrange(date) %>%
+  mutate(cum_ret = cumprod(1 + return)) %>%
+  ungroup()
+
+ggplot(ff_returns_cum, aes(x = date, y = cum_ret, color = type)) +
+  geom_line() +
+  labs(title = "Cumulative Return: FF Regression vs Actual",
+       y = "Cumulative Return", x = "Date") +
+  theme_minimal()
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
